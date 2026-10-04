@@ -16,4 +16,5 @@ __pycache__/
 models/
 outputs/
 
-chroma_db/
+chroma_db/**/checkpoint/
+**/checkpoint/
