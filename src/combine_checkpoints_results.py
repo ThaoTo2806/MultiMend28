@@ -1,3 +1,4 @@
+import os
 from itertools import chain
 
 import pandas as pd
@@ -41,7 +42,10 @@ else:
     raise ValueError("Wrong dataset name")
 
 
-output_dir = gen_dir / f"outputs-{model}"
+context_strategy = os.environ.get("MULTIMEND_CONTEXT_STRATEGY", "fixed_rag")
+if context_strategy not in {"no_rag", "fixed_rag"}:
+    raise ValueError(f"Unsupported context strategy: {context_strategy}")
+output_dir = gen_dir / f"outputs-{model}-{context_strategy}"
 
 output_size = 100
 num_checkpoints = 5

@@ -57,8 +57,18 @@ class RAG:
 
     def retrieve(
         self, query: str, query_metadata: dict, n_return: int, threshold: float = None
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[str], list[dict]]:
         """Retrieve top-n chunks based on the given query"""
+
+        documents, metadatas, _ = self.retrieve_with_scores(
+            query, query_metadata, n_return, threshold
+        )
+        return documents, metadatas
+
+    def retrieve_with_scores(
+        self, query: str, query_metadata: dict, n_return: int, threshold: float = None
+    ) -> tuple[list[str], list[dict], list[float]]:
+        """Retrieve chunks and their cosine distances for instrumentation."""
 
         embeddings = self.model.encode(query, batch_size=32)
 
@@ -73,13 +83,23 @@ class RAG:
             ),
         )
 
-        if threshold:
-            filtered = [d for d in results["distances"][0] if d <= threshold]
-            return results["documents"][0][: len(filtered)], results["metadatas"][0][
-                : len(filtered)
+        documents = results["documents"][0]
+        metadatas = results["metadatas"][0]
+        distances = results["distances"][0]
+        if threshold is not None:
+            selected = [
+                (document, metadata, distance)
+                for document, metadata, distance in zip(
+                    documents, metadatas, distances
+                )
+                if distance <= threshold
             ]
-        else:
-            return results["documents"][0], results["metadatas"][0]
+            documents, metadatas, distances = (
+                [item[0] for item in selected],
+                [item[1] for item in selected],
+                [item[2] for item in selected],
+            )
+        return documents, metadatas, distances
 
 
 def main():

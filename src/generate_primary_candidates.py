@@ -1,4 +1,5 @@
 import json
+import os
 import string
 from collections import ChainMap, defaultdict
 from itertools import chain
@@ -29,30 +30,39 @@ set_seed(42)
 # Config
 dataset = "QuixBugs-Python"
 model_name = "multimend-codet5-small"
+context_strategy = os.environ.get("MULTIMEND_CONTEXT_STRATEGY", "fixed_rag")
+if context_strategy not in {"no_rag", "fixed_rag"}:
+    raise ValueError(f"Unsupported context strategy: {context_strategy}")
 
 
 def get_checkpoints(checkpoints_dir: Path) -> list[tuple[str, Path]]:
-    """Get the list of checkpoints from the checkpoints directory"""
+    """Return the final checkpoints ordered by trainer_state global_step."""
 
-    checkpoints: dict[str, Path] = {}
-    for d in checkpoints_dir.iterdir():
-        name_parts = d.name.split("-")
-        if (
-            len(name_parts) == 2
-            and name_parts[0] == "checkpoint"
-            and name_parts[1].isdigit()
-        ):
-            checkpoints[d.name] = d
-
-    sorted_checkpoints = sorted(
-        checkpoints.items(), key=lambda x: int(x[0].split("-")[1])
-    )
-
-    return sorted_checkpoints
+    checkpoints: list[tuple[int, str, Path]] = []
+    for checkpoint in checkpoints_dir.glob("checkpoint-*"):
+        state_file = checkpoint / "trainer_state.json"
+        if not state_file.is_file():
+            continue
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        step = state.get("global_step")
+        if isinstance(step, int) and step >= 0:
+            checkpoints.append((step, checkpoint.name, checkpoint))
+    checkpoints.sort(key=lambda item: item[0])
+    if len(checkpoints) < num_checkpoints:
+        raise RuntimeError(
+            f"Need at least {num_checkpoints} valid checkpoints, found {len(checkpoints)}"
+        )
+    selected = checkpoints[-num_checkpoints:]
+    if len({step for step, _, _ in selected}) != num_checkpoints:
+        raise RuntimeError("Selected checkpoints have duplicate global_step values")
+    print("Selected checkpoints:")
+    for step, name, _ in selected:
+        print(f"- {name}: global_step={step}")
+    return [(name, checkpoint) for step, name, checkpoint in selected]
 
 
 def load_test_input_from_meta(prefix: str) -> Dataset:
-    """Extract source and context from metadata file"""
+    """Build inputs and record retrieval/truncation instrumentation."""
 
     def prepare(hunk: str) -> str:
         lines_concat = " ".join([line.strip() for line in hunk.splitlines()])
@@ -60,8 +70,9 @@ def load_test_input_from_meta(prefix: str) -> Dataset:
 
     n_return = 5
     threshold = 0.5
-    rag = RAG(dataset.split("_")[0])
+    rag = RAG(dataset) if context_strategy == "fixed_rag" else None
     test_data = defaultdict(list)
+    context_log: list[dict] = []
 
     with open(gen_dir / bugs_metadata_file) as meta_file:
         bugs_metadata = ChainMap(*[json.loads(line) for line in meta_file][::-1])
@@ -74,10 +85,22 @@ def load_test_input_from_meta(prefix: str) -> Dataset:
             context = " ".join(hunk["source_context"][0].split())
 
             metadata = {"bugid": bugid, "hunk": h}
-            rag_result = None
-            if src.strip(string.punctuation + string.whitespace):
-                docs, metas = rag.retrieve(src, metadata, n_return, threshold)
-                rag_result = f" ".join(docs)
+            docs: list[str] = []
+            distances: list[float] = []
+            raw_docs: list[str] = []
+            raw_distances: list[float] = []
+            if rag is not None and src.strip(string.punctuation + string.whitespace):
+                raw_docs, _, raw_distances = rag.retrieve_with_scores(
+                    src, metadata, n_return
+                )
+                selected = [
+                    (doc, distance)
+                    for doc, distance in zip(raw_docs, raw_distances)
+                    if distance <= threshold
+                ]
+                docs = [doc for doc, _ in selected]
+                distances = [distance for _, distance in selected]
+            rag_result = " ".join(docs)
 
             print(bugid, h)
             if rag_result:
@@ -89,8 +112,52 @@ def load_test_input_from_meta(prefix: str) -> Dataset:
                     tokenizer.eos_token, tokenizer.unk_token
                 )
             test_data["inputs"].append(test_input)
+            untruncated_tokens = len(
+                tokenizer(test_input, truncation=False)["input_ids"]
+            )
+            truncated_tokens = len(
+                tokenizer(
+                    test_input,
+                    truncation=True,
+                    max_length=max_input_length,
+                )["input_ids"]
+            )
+            local_only = f"{source} {context}".replace(
+                tokenizer.eos_token, tokenizer.unk_token
+            )
+            local_tokens = len(tokenizer(local_only, truncation=False)["input_ids"])
+            context_log.append(
+                {
+                    "bugid": bugid,
+                    "hunk": h,
+                    "context_strategy": context_strategy,
+                    "retrieved_count": len(docs),
+                    "raw_candidates": [
+                        {
+                            "document": doc,
+                            "distance": distance,
+                            "similarity": 1 - distance,
+                        }
+                        for doc, distance in zip(raw_docs, raw_distances)
+                    ],
+                    "selected_distances": distances,
+                    "input_tokens_before_truncation": untruncated_tokens,
+                    "input_tokens_after_truncation": truncated_tokens,
+                    "local_context_tokens_without_retrieval": local_tokens,
+                    "local_context_at_risk": (
+                        untruncated_tokens > max_input_length
+                        and local_tokens <= max_input_length
+                    ),
+                    "was_truncated": untruncated_tokens > max_input_length,
+                    "threshold": threshold if rag is not None else None,
+                }
+            )
 
     test_dataset = Dataset.from_dict(test_data)
+    log_path = gen_dir / f"context_log_{context_strategy}.jsonl"
+    with log_path.open("w", encoding="utf-8") as log_file:
+        for record in context_log:
+            log_file.write(json.dumps(record) + "\n")
     return test_dataset
 
 
@@ -191,7 +258,7 @@ else:
 
 
 checkpoints_dir = models_root / model_name
-output_dir = gen_dir / f"outputs-{model_name.split('-')[0]}"
+output_dir = gen_dir / f"outputs-{model_name.split('-')[0]}-{context_strategy}"
 
 max_input_length = 512
 max_target_length = 256
@@ -206,6 +273,7 @@ device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 checkpoints = get_checkpoints(checkpoints_dir)
 tokenizer = AutoTokenizer.from_pretrained(checkpoints[0][1])
 
+output_dir.mkdir(parents=True, exist_ok=True)
 test_dataset = load_test_input_from_meta(prefix)
 test_dataset.to_json(output_dir / "generated_input.jsonl")
 
@@ -222,6 +290,34 @@ checkpoints_results: list[Dataset] = []
 for ch_name, checkpoint in checkpoints[-num_checkpoints:]:
     print(f"Generating from {ch_name}...")
     model = AutoModelForSeq2SeqLM.from_pretrained(checkpoint).to(device)
+    decoder_start_token_id = next(
+        (
+            token_id
+            for token_id in (
+                model.config.decoder_start_token_id,
+                model.generation_config.decoder_start_token_id,
+                tokenizer.pad_token_id,
+            )
+            if token_id is not None
+        ),
+        None,
+    )
+    if decoder_start_token_id is None:
+        raise ValueError(
+            f"Checkpoint {ch_name} has no decoder_start_token_id and tokenizer "
+            "has no pad_token_id"
+        )
+    model.generation_config.decoder_start_token_id = decoder_start_token_id
+    model.generation_config.bos_token_id = model.config.bos_token_id
+    model.generation_config.eos_token_id = model.config.eos_token_id
+    model.generation_config.pad_token_id = next(
+        (
+            token_id
+            for token_id in (model.config.pad_token_id, tokenizer.pad_token_id)
+            if token_id is not None
+        ),
+        None,
+    )
     results = tokenized_test_dataset.map(
         lambda examples: generate_candidates(examples, model, ch_name),
         batched=True,

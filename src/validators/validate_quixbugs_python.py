@@ -1,5 +1,6 @@
 import contextlib
 import json
+import os
 import shutil
 import subprocess
 import threading
@@ -24,7 +25,10 @@ gen_dir = quixbugs_genpy_dir
 bugs_metadata_file = "QuixBugs_Python.jsonl"
 model = "multimend"
 
-output_dir = gen_dir / f"outputs-{model}"
+context_strategy = os.environ.get("MULTIMEND_CONTEXT_STRATEGY", "fixed_rag")
+if context_strategy not in {"no_rag", "fixed_rag"}:
+    raise ValueError(f"Unsupported context strategy: {context_strategy}")
+output_dir = gen_dir / f"outputs-{model}-{context_strategy}"
 temp_dir = output_dir / "temp"
 save_state_dir = output_dir / "save-state"
 output_size = 100
