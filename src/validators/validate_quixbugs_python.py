@@ -32,6 +32,9 @@ output_dir = gen_dir / f"outputs-{model}-{context_strategy}"
 temp_dir = output_dir / "temp"
 save_state_dir = output_dir / "save-state"
 output_size = 100
+validation_timeout = int(os.environ.get("MULTIMEND_VALIDATION_TIMEOUT", "60"))
+validation_sleep = float(os.environ.get("MULTIMEND_VALIDATION_SLEEP", "1"))
+validation_jobs = int(os.environ.get("MULTIMEND_VALIDATION_JOBS", "6"))
 
 rem_file_path = gen_dir / "rem.txt"
 add_file_path = gen_dir / "add.txt"
@@ -93,7 +96,6 @@ class Status(Enum):
 
 
 def run_tests(bugid: str, project_copy_dir: Path) -> Status:
-    timeout = 60  # seconds
     tests_dir = project_copy_dir / "python_testcases"
     test_file = f"test_{bugid}.py"
 
@@ -106,7 +108,7 @@ def run_tests(bugid: str, project_copy_dir: Path) -> Status:
         result = subprocess.run(
             args,
             capture_output=True,
-            timeout=timeout,
+            timeout=validation_timeout,
         )
     except subprocess.TimeoutExpired:
         return Status.TIMEOUT
@@ -123,7 +125,9 @@ def apply_patch(cp_df: pd.DataFrame, bugid: str, hunks: list) -> Optional[pd.Dat
     # Load if already processed
     save_file_path = save_state_dir / f"{bugid}.jsonl"
     if save_file_path.exists():
-        return
+        saved = pd.read_json(save_file_path, orient="records", lines=True)
+        if "correct" in saved:
+            return
 
     pid = threading.get_ident()
 
@@ -159,7 +163,15 @@ def apply_patch(cp_df: pd.DataFrame, bugid: str, hunks: list) -> Optional[pd.Dat
             if passed is Status.PLAUSIBLE:
                 cp_df.at[index, "plausible"] = True
                 cp_df.at[index, "parsable"] = True
-                break
+                if bool(cp_df.at[index, "exact_match"]):
+                    cp_df.at[index, "correct"] = True
+                # Continue only for exact-match candidates so that their
+                # correctness is validated even after a plausible patch.
+                remaining_exact = cp_df.loc[
+                    cp_df.index > index, "exact_match"
+                ].fillna(False)
+                if not remaining_exact.any():
+                    break
             elif passed is Status.PARSABLE:
                 cp_df.at[index, "parsable"] = True
             elif passed is Status.TIMEOUT:
@@ -167,7 +179,8 @@ def apply_patch(cp_df: pd.DataFrame, bugid: str, hunks: list) -> Optional[pd.Dat
                 cp_df.at[index, "parsable"] = True
 
             # pytest shows some inconsistent behavior on some source files if ran fast!
-            time.sleep(1)
+            if validation_sleep > 0:
+                time.sleep(validation_sleep)
 
         # Save intermediate state
         cp_df.to_json(save_state_dir / f"{bugid}.jsonl", orient="records", lines=True)
@@ -183,8 +196,6 @@ def copy_dataset_files(dataset_dir, temp_dataset_dir):
 
 
 def main():
-    n_jobs = 6
-
     with open(gen_dir / bugs_metadata_file) as meta_file:
         bugs_metadata = ChainMap(*[json.loads(line) for line in meta_file][::-1])
 
@@ -194,6 +205,7 @@ def main():
         lines=True,
     )
     candidate_patches_df["plausible"] = False
+    candidate_patches_df["correct"] = False
     candidate_patches_df["parsable"] = False
     candidate_patches_df["timeout"] = False
     candidate_patches_df["validation_time"] = np.nan
@@ -203,7 +215,7 @@ def main():
     save_state_dir.mkdir(parents=True, exist_ok=True)
 
     with tqdm_joblib(tqdm(total=len(bugs_metadata))):
-        Parallel(n_jobs=n_jobs, backend="threading")(
+        Parallel(n_jobs=validation_jobs, backend="threading")(
             delayed(apply_patch)(
                 deepcopy(get_candidates(candidate_patches_df, bugid)), bugid, hunks
             )
