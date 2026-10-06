@@ -1,3 +1,4 @@
+
 import contextlib
 import json
 import os
@@ -20,6 +21,7 @@ from tqdm import tqdm
 
 from ..configs import quixbugs_dir, quixbugs_genpy_dir
 
+
 project_dir = quixbugs_dir
 gen_dir = quixbugs_genpy_dir
 bugs_metadata_file = "QuixBugs_Python.jsonl"
@@ -28,13 +30,26 @@ model = "multimend"
 context_strategy = os.environ.get("MULTIMEND_CONTEXT_STRATEGY", "fixed_rag")
 if context_strategy not in {"no_rag", "fixed_rag"}:
     raise ValueError(f"Unsupported context strategy: {context_strategy}")
+
 output_dir = gen_dir / f"outputs-{model}-{context_strategy}"
 temp_dir = output_dir / "temp"
 save_state_dir = output_dir / "save-state"
 output_size = 100
-validation_timeout = int(os.environ.get("MULTIMEND_VALIDATION_TIMEOUT", "60"))
-validation_sleep = float(os.environ.get("MULTIMEND_VALIDATION_SLEEP", "1"))
-validation_jobs = int(os.environ.get("MULTIMEND_VALIDATION_JOBS", "6"))
+
+# Configurable through environment variables.
+# Validation configuration.
+# Default timeout remains 60 seconds, but can be overridden by environment.
+DEFAULT_TEST_TIMEOUT = float(
+    os.environ.get("MULTIMEND_VALIDATION_TIMEOUT", "60")
+)
+
+CANDIDATE_SLEEP = float(
+    os.environ.get("MULTIMEND_VALIDATION_SLEEP", "1.0")
+)
+
+N_WORKERS = int(
+    os.environ.get("MULTIMEND_VALIDATION_JOBS", "6")
+)
 
 rem_file_path = gen_dir / "rem.txt"
 add_file_path = gen_dir / "add.txt"
@@ -49,7 +64,7 @@ with (
 
 @contextlib.contextmanager
 def tqdm_joblib(tqdm_object):
-    """Context manager to patch joblib to report into tqdm progress bar given as argument"""
+    """Context manager to patch joblib to report into tqdm progress bar."""
 
     def tqdm_print_progress(self):
         if self.n_completed_tasks > tqdm_object.n:
@@ -67,22 +82,23 @@ def tqdm_joblib(tqdm_object):
 
 
 def get_hunk_candidates(df: pd.DataFrame, hunk: int) -> pd.DataFrame:
-    """Returns the subset of `df` containing candidate patches for a specific hunk of a bug"""
+    """Returns candidate patches for a specific hunk."""
     return df.loc[df["hunk"] == hunk]
 
 
 def get_candidates(df: pd.DataFrame, bugid: str) -> pd.DataFrame:
-    """Returns the subset of `df` containing candidate patches for a specific bugid and all its hunks"""
+    """Returns candidate patches for a specific bugid."""
     return df.loc[df["bugid"] == bugid]
 
 
 def insert_patch(patch, source_file_path, target_file_path, bug_line, bug_len, indent):
     with open(source_file_path, "r") as file:
         lines = file.readlines()
+
     if bug_len == 0:
         lines.insert(bug_line, indent + patch + "\n")
     else:
-        lines[bug_line - 1 : (bug_line - 1) + bug_len] = indent + patch + "\n"
+        lines[bug_line - 1 : (bug_line - 1) + bug_len] = [indent + patch + "\n"]
 
     with open(target_file_path, "w") as file:
         file.writelines(lines)
@@ -96,6 +112,10 @@ class Status(Enum):
 
 
 def run_tests(bugid: str, project_copy_dir: Path) -> Status:
+    """Run pytest for one candidate patch."""
+
+    timeout = DEFAULT_TEST_TIMEOUT
+
     tests_dir = project_copy_dir / "python_testcases"
     test_file = f"test_{bugid}.py"
 
@@ -104,11 +124,12 @@ def run_tests(bugid: str, project_copy_dir: Path) -> Status:
         "-x",
         str(tests_dir / test_file),
     ]
+
     try:
         result = subprocess.run(
             args,
             capture_output=True,
-            timeout=validation_timeout,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         return Status.TIMEOUT
@@ -121,69 +142,191 @@ def run_tests(bugid: str, project_copy_dir: Path) -> Status:
         return Status.PARSABLE
 
 
-def apply_patch(cp_df: pd.DataFrame, bugid: str, hunks: list) -> Optional[pd.DataFrame]:
-    # Load if already processed
+def get_developer_patch(hunk: dict) -> str:
+    """
+    Return the developer patch used for exact-match evaluation.
+
+    The developer patch is the content of the added_lines field.
+    """
+    return hunk["added_lines"]
+
+
+def normalize_patch(patch) -> str:
+    """Normalize patch text for exact-match comparison."""
+    if patch is None:
+        return ""
+
+    return str(patch).strip()
+
+
+def compute_correct(
+    cp_df: pd.DataFrame,
+    hunk: dict,
+) -> pd.Series:
+    """
+    Compute exact-match correctness for every candidate.
+
+    `correct` is True iff decoded_sequences exactly matches
+    the developer patch after normalization.
+    """
+    developer_patch = normalize_patch(get_developer_patch(hunk))
+
+    return cp_df["decoded_sequences"].map(
+        lambda patch: normalize_patch(patch) == developer_patch
+    )
+
+
+def ensure_correct_column(
+    cp_df: pd.DataFrame,
+    hunk: dict,
+) -> pd.DataFrame:
+    """
+    Make sure old save-state files have the `correct` column.
+
+    If `correct` is missing, recompute it from exact-match with
+    the developer patch.
+    """
+    if "correct" not in cp_df.columns:
+        cp_df["correct"] = compute_correct(cp_df, hunk)
+    else:
+        cp_df["correct"] = cp_df["correct"].fillna(False).astype(bool)
+
+    return cp_df
+
+
+def apply_patch(
+    cp_df: pd.DataFrame,
+    bugid: str,
+    hunks: list,
+) -> Optional[pd.DataFrame]:
+
     save_file_path = save_state_dir / f"{bugid}.jsonl"
+
+    # ---------------------------------------------------------
+    # Load old save-state.
+    # If it does not contain `correct`, add it using exact-match.
+    # ---------------------------------------------------------
     if save_file_path.exists():
-        saved = pd.read_json(save_file_path, orient="records", lines=True)
-        if "correct" in saved:
-            return
+        saved_df = pd.read_json(
+            save_file_path,
+            orient="records",
+            lines=True,
+        )
+
+        for hunk_index, hunk in enumerate(hunks):
+            hunk_df = saved_df.loc[saved_df["hunk"] == hunk_index]
+
+            if len(hunk_df) > 0:
+                mask = saved_df["hunk"] == hunk_index
+                saved_df.loc[mask, "correct"] = compute_correct(
+                    saved_df.loc[mask],
+                    hunk,
+                ).values
+
+        # If the old save-state did not have `correct`, save it now.
+        saved_df.to_json(
+            save_file_path,
+            orient="records",
+            lines=True,
+        )
+
+        return saved_df
 
     pid = threading.get_ident()
 
     if len(hunks) == 1:
         hunk = hunks[0]
 
-        # Copy QuixBugs files to a working directory
         project_copy_dir = temp_dir / str(pid) / "QuixBugs"
         copy_dataset_files(project_dir, project_copy_dir)
 
         target_file_path = project_copy_dir / "python_programs" / f"{bugid}.py"
+
         bug_line, bug_len = hunk["removed_line_numbers_range"]
         bug_hunk_subset_df = get_hunk_candidates(cp_df, 0)
 
-        source_file_path = temp_dir / str(pid) / "sources" / bugid / f"{bugid}.py"
+        source_file_path = (
+            temp_dir / str(pid) / "sources" / bugid / f"{bugid}.py"
+        )
         source_file_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(target_file_path, source_file_path)
 
-        indent_size = len(hunk["added_lines"]) - len(hunk["added_lines"].lstrip(" \t"))
+        indent_size = len(hunk["added_lines"]) - len(
+            hunk["added_lines"].lstrip(" \t")
+        )
         indent = hunk["added_lines"][:indent_size]
 
+        # Compute exact-match correctness before running tests.
+        cp_df["correct"] = compute_correct(cp_df, hunk)
+
+        print(
+            f"[VALIDATOR] bug={bugid} candidates={len(bug_hunk_subset_df)}",
+            flush=True,
+        )
+
         for index, patch in bug_hunk_subset_df["decoded_sequences"].items():
-            insert_patch(
-                patch, source_file_path, target_file_path, bug_line, bug_len, indent
+
+            print(
+                f"[VALIDATOR] START index={index}",
+                flush=True,
             )
 
-            # call the testing infrastructure
+            # Restore original source before applying candidate.
+            shutil.copyfile(source_file_path, target_file_path)
+
+            insert_patch(
+                patch,
+                source_file_path,
+                target_file_path,
+                bug_line,
+                bug_len,
+                indent,
+            )
+
             start_timer = timeit.default_timer()
-            passed = run_tests(bugid, project_copy_dir)
+
+            passed = run_tests(
+                bugid,
+                project_copy_dir,
+            )
+
             end_timer = timeit.default_timer()
-            cp_df.at[index, "validation_time"] = end_timer - start_timer
+
+            cp_df.at[index, "validation_time"] = (
+                end_timer - start_timer
+            )
 
             if passed is Status.PLAUSIBLE:
                 cp_df.at[index, "plausible"] = True
                 cp_df.at[index, "parsable"] = True
-                if bool(cp_df.at[index, "exact_match"]):
-                    cp_df.at[index, "correct"] = True
-                # Continue only for exact-match candidates so that their
-                # correctness is validated even after a plausible patch.
-                remaining_exact = cp_df.loc[
-                    cp_df.index > index, "exact_match"
-                ].fillna(False)
-                if not remaining_exact.any():
-                    break
+
+                # Do NOT break here.
+                #
+                # We still need to evaluate every candidate so that
+                # `correct` is recorded correctly.
+                #
+                # Exact-match is independent from pytest plausibility.
+
             elif passed is Status.PARSABLE:
                 cp_df.at[index, "parsable"] = True
+
             elif passed is Status.TIMEOUT:
                 cp_df.at[index, "timeout"] = True
                 cp_df.at[index, "parsable"] = True
 
-            # pytest shows some inconsistent behavior on some source files if ran fast!
-            if validation_sleep > 0:
-                time.sleep(validation_sleep)
+            # Configurable sleep between candidates.
+            time.sleep(CANDIDATE_SLEEP)
 
-        # Save intermediate state
-        cp_df.to_json(save_state_dir / f"{bugid}.jsonl", orient="records", lines=True)
+        # Save intermediate state.
+        cp_df.to_json(
+            save_state_dir / f"{bugid}.jsonl",
+            orient="records",
+            lines=True,
+        )
+
+        return cp_df
+
+    return cp_df
 
 
 def copy_dataset_files(dataset_dir, temp_dataset_dir):
@@ -196,52 +339,193 @@ def copy_dataset_files(dataset_dir, temp_dataset_dir):
 
 
 def main():
+
+    n_jobs = N_WORKERS
+
+    print(
+        "[VALIDATOR CONFIG] "
+        f"test_timeout={DEFAULT_TEST_TIMEOUT}s, "
+        f"candidate_sleep={CANDIDATE_SLEEP}s, "
+        f"workers={n_jobs}",
+        flush=True,
+    )
+
     with open(gen_dir / bugs_metadata_file) as meta_file:
-        bugs_metadata = ChainMap(*[json.loads(line) for line in meta_file][::-1])
+        bugs_metadata = ChainMap(
+            *[json.loads(line) for line in meta_file][::-1]
+        )
+
+    # Programs excluded from validation.
+    skipped_programs = {
+        "detect_cycle_test",
+        "shortest_path_length_test",
+    }
+
+    metadata_programs = len(bugs_metadata)
+
+    bugs_metadata = {
+        bugid: hunks
+        for bugid, hunks in bugs_metadata.items()
+        if bugid not in skipped_programs
+    }
+
+    print(f"Metadata programs: {metadata_programs}")
+    print(f"Programs to validate: {len(bugs_metadata)}")
+    print(f"Skipped: {sorted(skipped_programs)}")
 
     candidate_patches_df = pd.read_json(
         output_dir / f"final_candidates_{output_size}.jsonl",
         orient="records",
         lines=True,
     )
+
+    # Always initialize these columns.
     candidate_patches_df["plausible"] = False
     candidate_patches_df["correct"] = False
     candidate_patches_df["parsable"] = False
     candidate_patches_df["timeout"] = False
     candidate_patches_df["validation_time"] = np.nan
 
-    shutil.rmtree(temp_dir, ignore_errors=True)
+    shutil.rmtree(
+        temp_dir,
+        ignore_errors=True,
+    )
 
-    save_state_dir.mkdir(parents=True, exist_ok=True)
+    save_state_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     with tqdm_joblib(tqdm(total=len(bugs_metadata))):
-        Parallel(n_jobs=validation_jobs, backend="threading")(
+        Parallel(
+            n_jobs=n_jobs,
+            backend="threading",
+        )(
             delayed(apply_patch)(
-                deepcopy(get_candidates(candidate_patches_df, bugid)), bugid, hunks
+                deepcopy(
+                    get_candidates(
+                        candidate_patches_df,
+                        bugid,
+                    )
+                ),
+                bugid,
+                hunks,
             )
             for bugid, hunks in bugs_metadata.items()
         )
 
-    cp_dfs = [
-        pd.read_json(cp, orient="records", lines=True)
-        for cp in sorted(save_state_dir.iterdir())
-    ]
-    concatenated_cp_df = pd.concat(cp_dfs, ignore_index=True)
+    cp_dfs = []
+
+    for cp in sorted(save_state_dir.iterdir()):
+
+        if cp.suffix != ".jsonl":
+            continue
+
+        df = pd.read_json(
+            cp,
+            orient="records",
+            lines=True,
+        )
+
+        # -----------------------------------------------------
+        # Backward compatibility:
+        # old save-state may not have `correct`.
+        # Recompute it from exact-match.
+        # -----------------------------------------------------
+        if "correct" not in df.columns:
+
+            print(
+                f"[VALIDATOR] Recomputing missing `correct`: {cp}",
+                flush=True,
+            )
+
+            # Empty or malformed old save-state must not crash validation.
+            if df.empty or "bugid" not in df.columns:
+                print(
+                    f"[VALIDATOR] Ignoring empty/malformed save-state: {cp}",
+                    flush=True,
+                )
+                continue
+
+            # Empty or malformed old save-state must not crash validation.
+            if df.empty or "bugid" not in df.columns:
+                print(
+                    f"[VALIDATOR] Ignoring empty/malformed save-state: {cp}",
+                    flush=True,
+                )
+                continue
+
+            bugids = df["bugid"].unique()
+
+            for bugid in bugids:
+                if bugid not in bugs_metadata:
+                    continue
+
+                bug_hunks = bugs_metadata[bugid]
+
+                for hunk_index, hunk in enumerate(bug_hunks):
+
+                    mask = (
+                        (df["bugid"] == bugid)
+                        & (df["hunk"] == hunk_index)
+                    )
+
+                    if mask.any():
+                        df.loc[mask, "correct"] = compute_correct(
+                            df.loc[mask],
+                            hunk,
+                        ).values
+
+        df["correct"] = (
+            df["correct"]
+            .fillna(False)
+            .astype(bool)
+        )
+
+        cp_dfs.append(df)
+
+    concatenated_cp_df = pd.concat(
+        cp_dfs,
+        ignore_index=True,
+    )
+
     assert len(candidate_patches_df) == len(concatenated_cp_df)
+
     concatenated_cp_df.to_json(
         output_dir / f"plausible_candidates_{output_size}.jsonl",
         orient="records",
         lines=True,
     )
 
+    # ---------------------------------------------------------
+    # Plausible: patch passes pytest.
+    # ---------------------------------------------------------
     bugs_with_plausible_patch = (
-        concatenated_cp_df.groupby(["bugid", "hunk"])["plausible"]
+        concatenated_cp_df
+        .groupby(["bugid", "hunk"])["plausible"]
         .any()
         .groupby("bugid")
         .all()
     )
+
+    print("\n===== PLAUSIBLE =====")
     print(bugs_with_plausible_patch)
     print(bugs_with_plausible_patch.value_counts())
+
+    # ---------------------------------------------------------
+    # Correct: candidate exactly matches developer patch.
+    # ---------------------------------------------------------
+    bugs_with_correct_patch = (
+        concatenated_cp_df
+        .groupby(["bugid", "hunk"])["correct"]
+        .any()
+        .groupby("bugid")
+        .all()
+    )
+
+    print("\n===== CORRECT =====")
+    print(bugs_with_correct_patch)
+    print(bugs_with_correct_patch.value_counts())
 
 
 if __name__ == "__main__":
