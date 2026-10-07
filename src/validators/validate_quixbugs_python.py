@@ -142,58 +142,6 @@ def run_tests(bugid: str, project_copy_dir: Path) -> Status:
         return Status.PARSABLE
 
 
-def get_developer_patch(hunk: dict) -> str:
-    """
-    Return the developer patch used for exact-match evaluation.
-
-    The developer patch is the content of the added_lines field.
-    """
-    return hunk["added_lines"]
-
-
-def normalize_patch(patch) -> str:
-    """Normalize patch text for exact-match comparison."""
-    if patch is None:
-        return ""
-
-    return str(patch).strip()
-
-
-def compute_correct(
-    cp_df: pd.DataFrame,
-    hunk: dict,
-) -> pd.Series:
-    """
-    Compute exact-match correctness for every candidate.
-
-    `correct` is True iff decoded_sequences exactly matches
-    the developer patch after normalization.
-    """
-    developer_patch = normalize_patch(get_developer_patch(hunk))
-
-    return cp_df["decoded_sequences"].map(
-        lambda patch: normalize_patch(patch) == developer_patch
-    )
-
-
-def ensure_correct_column(
-    cp_df: pd.DataFrame,
-    hunk: dict,
-) -> pd.DataFrame:
-    """
-    Make sure old save-state files have the `correct` column.
-
-    If `correct` is missing, recompute it from exact-match with
-    the developer patch.
-    """
-    if "correct" not in cp_df.columns:
-        cp_df["correct"] = compute_correct(cp_df, hunk)
-    else:
-        cp_df["correct"] = cp_df["correct"].fillna(False).astype(bool)
-
-    return cp_df
-
-
 def apply_patch(
     cp_df: pd.DataFrame,
     bugid: str,
@@ -203,8 +151,8 @@ def apply_patch(
     save_file_path = save_state_dir / f"{bugid}.jsonl"
 
     # ---------------------------------------------------------
-    # Load old save-state.
-    # If it does not contain `correct`, add it using exact-match.
+    # Load old save-state and preserve the paper's normalized
+    # exact-match metric from final_candidates.
     # ---------------------------------------------------------
     if save_file_path.exists():
         saved_df = pd.read_json(
@@ -213,15 +161,8 @@ def apply_patch(
             lines=True,
         )
 
-        for hunk_index, hunk in enumerate(hunks):
-            hunk_df = saved_df.loc[saved_df["hunk"] == hunk_index]
-
-            if len(hunk_df) > 0:
-                mask = saved_df["hunk"] == hunk_index
-                saved_df.loc[mask, "correct"] = compute_correct(
-                    saved_df.loc[mask],
-                    hunk,
-                ).values
+        if "exact_match" in saved_df.columns:
+            saved_df["correct"] = saved_df["exact_match"].fillna(False).astype(bool)
 
         # If the old save-state did not have `correct`, save it now.
         saved_df.to_json(
@@ -256,8 +197,10 @@ def apply_patch(
         )
         indent = hunk["added_lines"][:indent_size]
 
-        # Compute exact-match correctness before running tests.
-        cp_df["correct"] = compute_correct(cp_df, hunk)
+        # Paper correctness is normalized exact match, already computed
+        # during candidate combining.
+        if "exact_match" in cp_df.columns:
+            cp_df["correct"] = cp_df["exact_match"].fillna(False).astype(bool)
 
         print(
             f"[VALIDATOR] bug={bugid} candidates={len(bug_hunk_subset_df)}",
@@ -299,13 +242,7 @@ def apply_patch(
             if passed is Status.PLAUSIBLE:
                 cp_df.at[index, "plausible"] = True
                 cp_df.at[index, "parsable"] = True
-
-                # Do NOT break here.
-                #
-                # We still need to evaluate every candidate so that
-                # `correct` is recorded correctly.
-                #
-                # Exact-match is independent from pytest plausibility.
+                break
 
             elif passed is Status.PARSABLE:
                 cp_df.at[index, "parsable"] = True
@@ -427,54 +364,8 @@ def main():
             lines=True,
         )
 
-        # -----------------------------------------------------
-        # Backward compatibility:
-        # old save-state may not have `correct`.
-        # Recompute it from exact-match.
-        # -----------------------------------------------------
-        if "correct" not in df.columns:
-
-            print(
-                f"[VALIDATOR] Recomputing missing `correct`: {cp}",
-                flush=True,
-            )
-
-            # Empty or malformed old save-state must not crash validation.
-            if df.empty or "bugid" not in df.columns:
-                print(
-                    f"[VALIDATOR] Ignoring empty/malformed save-state: {cp}",
-                    flush=True,
-                )
-                continue
-
-            # Empty or malformed old save-state must not crash validation.
-            if df.empty or "bugid" not in df.columns:
-                print(
-                    f"[VALIDATOR] Ignoring empty/malformed save-state: {cp}",
-                    flush=True,
-                )
-                continue
-
-            bugids = df["bugid"].unique()
-
-            for bugid in bugids:
-                if bugid not in bugs_metadata:
-                    continue
-
-                bug_hunks = bugs_metadata[bugid]
-
-                for hunk_index, hunk in enumerate(bug_hunks):
-
-                    mask = (
-                        (df["bugid"] == bugid)
-                        & (df["hunk"] == hunk_index)
-                    )
-
-                    if mask.any():
-                        df.loc[mask, "correct"] = compute_correct(
-                            df.loc[mask],
-                            hunk,
-                        ).values
+        if "correct" not in df.columns and "exact_match" in df.columns:
+            df["correct"] = df["exact_match"].fillna(False).astype(bool)
 
         df["correct"] = (
             df["correct"]
