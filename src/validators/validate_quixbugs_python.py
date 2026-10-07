@@ -125,18 +125,22 @@ def run_tests(bugid: str, project_copy_dir: Path) -> Status:
         str(tests_dir / test_file),
     ]
 
+    process = subprocess.Popen(
+        args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
     try:
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            timeout=timeout,
-        )
+        process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
         return Status.TIMEOUT
 
-    if result.returncode == 0:
+    if process.returncode == 0:
         return Status.PLAUSIBLE
-    elif result.returncode == 2:
+    elif process.returncode == 2:
         return Status.UNPARSABLE
     else:
         return Status.PARSABLE
@@ -165,11 +169,7 @@ def apply_patch(
             saved_df["correct"] = saved_df["exact_match"].fillna(False).astype(bool)
 
         # If the old save-state did not have `correct`, save it now.
-        saved_df.to_json(
-            save_file_path,
-            orient="records",
-            lines=True,
-        )
+        save_validation_state(saved_df, bugid)
 
         return saved_df
 
@@ -251,15 +251,14 @@ def apply_patch(
                 cp_df.at[index, "timeout"] = True
                 cp_df.at[index, "parsable"] = True
 
+            # Keep partial progress if a long-running bug is interrupted.
+            save_validation_state(cp_df, bugid)
+
             # Configurable sleep between candidates.
             time.sleep(CANDIDATE_SLEEP)
 
         # Save intermediate state.
-        cp_df.to_json(
-            save_state_dir / f"{bugid}.jsonl",
-            orient="records",
-            lines=True,
-        )
+        save_validation_state(cp_df, bugid)
 
         return cp_df
 
@@ -273,6 +272,19 @@ def copy_dataset_files(dataset_dir, temp_dataset_dir):
         dirs_exist_ok=True,
         ignore=shutil.ignore_patterns(".*"),
     )
+
+
+def save_validation_state(df: pd.DataFrame, bugid: str) -> None:
+    """Persist a bug's state so interrupted validation can resume safely."""
+    save_state_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_state_dir / f"{bugid}.jsonl"
+    temporary_path = save_path.with_suffix(".jsonl.tmp")
+    df.to_json(
+        temporary_path,
+        orient="records",
+        lines=True,
+    )
+    temporary_path.replace(save_path)
 
 
 def main():
