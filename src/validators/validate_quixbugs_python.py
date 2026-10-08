@@ -155,8 +155,7 @@ def apply_patch(
     save_file_path = save_state_dir / f"{bugid}.jsonl"
 
     # ---------------------------------------------------------
-    # Load old save-state and preserve the paper's normalized
-    # exact-match metric from final_candidates.
+    # Load old save-state and preserve the separately computed metrics.
     # ---------------------------------------------------------
     if save_file_path.exists():
         saved_df = pd.read_json(
@@ -166,9 +165,12 @@ def apply_patch(
         )
 
         if "exact_match" in saved_df.columns:
-            saved_df["correct"] = saved_df["exact_match"].fillna(False).astype(bool)
-
-        # If the old save-state did not have `correct`, save it now.
+            saved_df["exact_match"] = (
+                saved_df["exact_match"].fillna(False).astype(bool)
+            )
+        saved_df.drop(columns=["correct"], errors="ignore", inplace=True)
+        if "paper_correct" not in saved_df.columns:
+            saved_df["paper_correct"] = False
         save_validation_state(saved_df, bugid)
 
         return saved_df
@@ -197,10 +199,13 @@ def apply_patch(
         )
         indent = hunk["added_lines"][:indent_size]
 
-        # Paper correctness is normalized exact match, already computed
-        # during candidate combining.
         if "exact_match" in cp_df.columns:
-            cp_df["correct"] = cp_df["exact_match"].fillna(False).astype(bool)
+            cp_df["exact_match"] = (
+                cp_df["exact_match"].fillna(False).astype(bool)
+            )
+        cp_df.drop(columns=["correct"], errors="ignore", inplace=True)
+        if "paper_correct" not in cp_df.columns:
+            cp_df["paper_correct"] = False
 
         print(
             f"[VALIDATOR] bug={bugid} candidates={len(bug_hunk_subset_df)}",
@@ -304,23 +309,13 @@ def main():
             *[json.loads(line) for line in meta_file][::-1]
         )
 
-    # Programs excluded from validation.
-    skipped_programs = {
-        "detect_cycle_test",
-        "shortest_path_length_test",
-    }
+    # Validate ALL programs.
+    # No programs are skipped.
 
     metadata_programs = len(bugs_metadata)
 
-    bugs_metadata = {
-        bugid: hunks
-        for bugid, hunks in bugs_metadata.items()
-        if bugid not in skipped_programs
-    }
-
     print(f"Metadata programs: {metadata_programs}")
     print(f"Programs to validate: {len(bugs_metadata)}")
-    print(f"Skipped: {sorted(skipped_programs)}")
 
     candidate_patches_df = pd.read_json(
         output_dir / f"final_candidates_{output_size}.jsonl",
@@ -330,7 +325,11 @@ def main():
 
     # Always initialize these columns.
     candidate_patches_df["plausible"] = False
-    candidate_patches_df["correct"] = False
+    if "paper_correct" not in candidate_patches_df.columns:
+        candidate_patches_df["paper_correct"] = False
+    candidate_patches_df["paper_correct"] = (
+        candidate_patches_df["paper_correct"].fillna(False).astype(bool)
+    )
     candidate_patches_df["parsable"] = False
     candidate_patches_df["timeout"] = False
     candidate_patches_df["validation_time"] = np.nan
@@ -376,14 +375,12 @@ def main():
             lines=True,
         )
 
-        if "correct" not in df.columns and "exact_match" in df.columns:
-            df["correct"] = df["exact_match"].fillna(False).astype(bool)
-
-        df["correct"] = (
-            df["correct"]
-            .fillna(False)
-            .astype(bool)
-        )
+        if "exact_match" not in df.columns:
+            df["exact_match"] = False
+        df["exact_match"] = df["exact_match"].fillna(False).astype(bool)
+        if "paper_correct" not in df.columns:
+            df["paper_correct"] = False
+        df["paper_correct"] = df["paper_correct"].fillna(False).astype(bool)
 
         cp_dfs.append(df)
 
@@ -416,19 +413,33 @@ def main():
     print(bugs_with_plausible_patch.value_counts())
 
     # ---------------------------------------------------------
-    # Correct: candidate exactly matches developer patch.
+    # Exact match: candidate matches the normalized developer patch.
     # ---------------------------------------------------------
-    bugs_with_correct_patch = (
+    bugs_with_exact_patch = (
         concatenated_cp_df
-        .groupby(["bugid", "hunk"])["correct"]
+        .groupby(["bugid", "hunk"])["exact_match"]
         .any()
         .groupby("bugid")
         .all()
     )
 
-    print("\n===== CORRECT =====")
-    print(bugs_with_correct_patch)
-    print(bugs_with_correct_patch.value_counts())
+    print("\n===== EXACT MATCH =====")
+    print(bugs_with_exact_patch)
+    print(bugs_with_exact_patch.value_counts())
+
+    # Paper correctness is a separate manual annotation and may include
+    # semantically equivalent patches.
+    bugs_with_paper_correct_patch = (
+        concatenated_cp_df
+        .groupby(["bugid", "hunk"])["paper_correct"]
+        .any()
+        .groupby("bugid")
+        .all()
+    )
+
+    print("\n===== PAPER CORRECT (MANUAL) =====")
+    print(bugs_with_paper_correct_patch)
+    print(bugs_with_paper_correct_patch.value_counts())
 
 
 if __name__ == "__main__":

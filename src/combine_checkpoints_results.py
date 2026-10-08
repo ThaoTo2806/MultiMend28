@@ -152,7 +152,10 @@ def combine_candidates(df: pd.DataFrame) -> pd.DataFrame:
 def set_exact_matches(df: pd.DataFrame) -> pd.DataFrame:
     exact_match_condition = df["normalized_patch"] == df["normalized_target"]
     df["exact_match"] = exact_match_condition
-    df["correct"] = False
+    # Paper correctness may include semantically equivalent patches and
+    # therefore cannot be inferred from the developer-patch string alone.
+    # It is kept as a separate, manually reviewed annotation.
+    df["paper_correct"] = False
     return df
 
 
