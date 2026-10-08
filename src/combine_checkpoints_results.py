@@ -1,6 +1,5 @@
 import os
 from itertools import chain
-from pathlib import Path
 
 import pandas as pd
 
@@ -14,278 +13,494 @@ from .configs import (
     runbugrunjs_gen_dir,
 )
 
+# ============================================================
 # Config
+# ============================================================
+
 dataset = "QuixBugs-Python"
 model = "multimend"
+
+context_strategy = os.environ.get(
+    "MULTIMEND_CONTEXT_STRATEGY",
+    "fixed_rag",
+)
+
+if context_strategy not in {"no_rag", "fixed_rag"}:
+    raise ValueError(
+        f"Unsupported context strategy: {context_strategy}"
+    )
+
+
+# ============================================================
+# Dataset
+# ============================================================
 
 if dataset == "QuixBugs-Python":
     gen_dir = quixbugs_genpy_dir
     bugs_metadata_file = "QuixBugs_Python.jsonl"
+
 elif dataset == "QuixBugs-Java":
     gen_dir = quixbugs_genjava_dir
     bugs_metadata_file = "QuixBugs_Java.jsonl"
+
 elif dataset == "Defects4J":
     gen_dir = d4j_gen_dir
     bugs_metadata_file = "Defects4J.jsonl"
+
 elif dataset == "BugAID":
     gen_dir = bugaid_gen_dir
     bugs_metadata_file = "BugAID.jsonl"
+
 elif dataset == "Codeflaws":
     gen_dir = codeflaws_gen_dir
     bugs_metadata_file = "Codeflaws.jsonl"
+
 elif dataset == "BugsInPy":
     gen_dir = bugsinpy_gen_dir
     bugs_metadata_file = "BugsInPy.jsonl"
+
 elif dataset == "RunBugRun-JS":
     gen_dir = runbugrunjs_gen_dir
     bugs_metadata_file = "RunBugRun-JS.jsonl"
+
 else:
     raise ValueError("Wrong dataset name")
 
 
-context_strategy = os.environ.get("MULTIMEND_CONTEXT_STRATEGY", "fixed_rag")
-if context_strategy not in {"no_rag", "fixed_rag"}:
-    raise ValueError(f"Unsupported context strategy: {context_strategy}")
-output_dir = gen_dir / f"outputs-{model}-{context_strategy}"
+output_dir = (
+    gen_dir
+    / f"outputs-{model}-{context_strategy}"
+)
 
 output_size = 100
 num_checkpoints = 5
-paper_correct_file = os.environ.get("MULTIMEND_PAPER_CORRECT_FILE")
+
+
+# ============================================================
+# Source / target
+# ============================================================
 
 rem_file_path = gen_dir / "rem.txt"
 add_file_path = gen_dir / "add.txt"
 
 with (
-    open(rem_file_path) as rem_file,
-    open(add_file_path) as add_file,
+    open(rem_file_path, encoding="utf-8") as rem_file,
+    open(add_file_path, encoding="utf-8") as add_file,
 ):
     sources = [src.strip() for src in rem_file]
     targets = [tgt.strip() for tgt in add_file]
 
 
 def add_source_target(df: pd.DataFrame) -> pd.DataFrame:
-    rem_file_path = gen_dir / "rem.txt"
-    add_file_path = gen_dir / "add.txt"
+    """
+    Add developer source and target patches.
 
-    with (
-        open(rem_file_path) as rem_file,
-        open(add_file_path) as add_file,
-    ):
-        sources = [src.strip() for src in rem_file]
-        targets = [tgt.strip() for tgt in add_file]
+    The generation order is:
 
-    checkpoints_num = len(df.value_counts("checkpoint"))
-    assert checkpoints_num == num_checkpoints
+        bug/hunk
+        x 100 candidates
+        x 5 checkpoints
+    """
 
-    df["source"] = list(chain(*[[s] * output_size for s in sources])) * num_checkpoints
-    df["target"] = list(chain(*[[t] * output_size for t in targets])) * num_checkpoints
+    checkpoints_num = df["checkpoint"].nunique()
 
-    for bugid, group in df.groupby("bugid"):
-        assert len(group["target"].unique()) <= len(group["hunk"].unique())
+    if checkpoints_num != num_checkpoints:
+        raise RuntimeError(
+            f"Expected {num_checkpoints} checkpoints, "
+            f"found {checkpoints_num}"
+        )
+
+    expected_rows = (
+        len(sources)
+        * output_size
+        * num_checkpoints
+    )
+
+    if len(df) != expected_rows:
+        raise RuntimeError(
+            f"Expected {expected_rows} generated rows, "
+            f"found {len(df)}"
+        )
+
+    source_values = list(
+        chain.from_iterable(
+            [[source] * output_size for source in sources]
+        )
+    )
+
+    target_values = list(
+        chain.from_iterable(
+            [[target] * output_size for target in targets]
+        )
+    )
+
+    df["source"] = (
+        source_values
+        * num_checkpoints
+    )
+
+    df["target"] = (
+        target_values
+        * num_checkpoints
+    )
 
     return df
 
+
+# ============================================================
+# Normalize
+# ============================================================
 
 def normalize(df: pd.DataFrame) -> pd.DataFrame:
-    df["decoded_sequences"] = df["decoded_sequences"].str.strip()
-    df["normalized_patch"] = df["decoded_sequences"].str.split().str.join(sep=" ")
-    df["normalized_source"] = df["source"].str.split().str.join(sep=" ")
-    df["normalized_target"] = df["target"].str.split().str.join(sep=" ")
+    """
+    Normalize generated patches and developer patches
+    for textual comparison.
+    """
+
+    df = df.copy()
+
+    df["decoded_sequences"] = (
+        df["decoded_sequences"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    df["normalized_patch"] = (
+        df["decoded_sequences"]
+        .str.split()
+        .str.join(" ")
+    )
+
+    df["normalized_source"] = (
+        df["source"]
+        .fillna("")
+        .astype(str)
+        .str.split()
+        .str.join(" ")
+    )
+
+    df["normalized_target"] = (
+        df["target"]
+        .fillna("")
+        .astype(str)
+        .str.split()
+        .str.join(" ")
+    )
+
     return df
 
 
-def create_empty_patch(patch_sample: pd.Series) -> pd.DataFrame:
-    patch_sample.loc["decoded_sequences"] = ""
-    patch_sample.loc["sequences_scores"] = 0
-    patch_sample.loc["normalized_patch"] = ""
-    patch_sample.loc["checkpoint"] = "manual"
-    patch_sample.loc["rank"] = 0
+# ============================================================
+# Empty patch
+# ============================================================
+
+def create_empty_patch(
+    patch_sample: pd.Series,
+) -> pd.DataFrame:
+
+    patch_sample = patch_sample.copy()
+
+    patch_sample["decoded_sequences"] = ""
+    patch_sample["sequences_scores"] = 0
+    patch_sample["normalized_patch"] = ""
+    patch_sample["checkpoint"] = "manual"
+    patch_sample["rank"] = 0
 
     return pd.DataFrame([patch_sample])
 
 
-def combine_candidates(df: pd.DataFrame) -> pd.DataFrame:
-    """deduplicate, sort and combine candidate patches of different checkpoints"""
+# ============================================================
+# Combine candidates
+# ============================================================
 
-    dfs = []
-    for _, subset_df in df.groupby(["bugid", "hunk", "checkpoint"]):
-        subset_df["rank"] = subset_df.reset_index(drop=True).index
-        dfs.append(subset_df)
+def combine_candidates(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Combine candidates from the five checkpoints.
 
-    ranked_df = pd.concat(dfs)
+    Paper-style processing:
 
-    ranked_df.loc[df["normalized_patch"] == "", ["rank", "sequences_scores"]] = [0, 0]
+    1. Rank candidates inside each checkpoint.
+    2. Sort by rank and model score.
+    3. Remove candidates identical to source.
+    4. Deduplicate candidates across checkpoints.
+    5. Add an empty patch candidate.
+    """
 
-    # Should sort based on scores before deduplication for `keep=first` to take effect
-    sorted_df = ranked_df.sort_values(
-        by=["bugid", "hunk", "rank", "sequences_scores"],
-        ascending=[True, True, True, False],
-        inplace=False,
+    df = df.copy()
+
+    # --------------------------------------------------------
+    # Rank candidates inside every checkpoint
+    # --------------------------------------------------------
+
+    ranked_groups = []
+
+    for (_, _, _), group in df.groupby(
+        ["bugid", "hunk", "checkpoint"],
+        sort=False,
+    ):
+        group = group.copy()
+
+        group["rank"] = (
+            group
+            .reset_index(drop=True)
+            .index
+        )
+
+        ranked_groups.append(group)
+
+    if not ranked_groups:
+        raise RuntimeError(
+            "No candidate patches found."
+        )
+
+    ranked_df = pd.concat(
+        ranked_groups,
         ignore_index=True,
     )
 
-    src_neq_df = sorted_df.loc[
-        sorted_df["normalized_patch"] != sorted_df["normalized_source"]
-    ]
-    sorted_df = src_neq_df.copy()
+    # Empty generated candidate gets rank 0.
+    empty_mask = (
+        ranked_df["normalized_patch"] == ""
+    )
+
+    ranked_df.loc[
+        empty_mask,
+        ["rank", "sequences_scores"],
+    ] = [0, 0]
+
+    # --------------------------------------------------------
+    # Sort
+    # --------------------------------------------------------
+
+    sorted_df = ranked_df.sort_values(
+        by=[
+            "bugid",
+            "hunk",
+            "rank",
+            "sequences_scores",
+        ],
+        ascending=[
+            True,
+            True,
+            True,
+            False,
+        ],
+        ignore_index=True,
+    )
+
+    # --------------------------------------------------------
+    # Remove candidate equal to original source
+    # --------------------------------------------------------
+
+    sorted_df = sorted_df.loc[
+        sorted_df["normalized_patch"]
+        != sorted_df["normalized_source"]
+    ].copy()
+
+    # --------------------------------------------------------
+    # Deduplicate generated patches
+    # --------------------------------------------------------
 
     deduped_df = sorted_df.drop_duplicates(
-        subset=["bugid", "hunk", "normalized_patch"],
-        inplace=False,
+        subset=[
+            "bugid",
+            "hunk",
+            "normalized_patch",
+        ],
+        keep="first",
         ignore_index=True,
     )
 
-    # Adding empty patch to hunks
-    concat_dfs = []
-    grouped_df = deduped_df.groupby(["bugid", "hunk"])
-    for _, group_df in grouped_df:
+    # --------------------------------------------------------
+    # Add empty patch candidate
+    # --------------------------------------------------------
+
+    output_groups = []
+
+    for (_, _), group_df in deduped_df.groupby(
+        ["bugid", "hunk"],
+        sort=False,
+    ):
+
+        group_df = group_df.copy()
+
+        has_empty_patch = (
+            ""
+            in group_df["normalized_patch"].values
+        )
+
+        has_source = bool(
+            group_df["normalized_source"]
+            .iloc[0]
+        )
+
         if (
-            "" not in group_df["normalized_patch"].values
-            and group_df["normalized_source"].values[0]
+            not has_empty_patch
+            and has_source
         ):
-            empty_patch = create_empty_patch(group_df.iloc[-1].copy())
-            concat_dfs.append(pd.concat([empty_patch, group_df], ignore_index=True))
-        else:
-            concat_dfs.append(group_df)
+            empty_patch = create_empty_patch(
+                group_df.iloc[-1]
+            )
 
-    return pd.concat(concat_dfs, ignore_index=True)
+            group_df = pd.concat(
+                [
+                    empty_patch,
+                    group_df,
+                ],
+                ignore_index=True,
+            )
 
+        output_groups.append(group_df)
 
-def load_paper_correct_annotations() -> dict[str, bool]:
-    """Load manually reviewed bug labels used by the paper protocol."""
-
-    if not paper_correct_file:
-        return {}
-
-    annotation_path = Path(paper_correct_file)
-    if not annotation_path.is_file():
-        raise FileNotFoundError(
-            "MULTIMEND_PAPER_CORRECT_FILE does not exist: "
-            f"{annotation_path}"
+    if not output_groups:
+        raise RuntimeError(
+            "No candidates remain after deduplication."
         )
 
-    annotations = pd.read_json(
-        annotation_path,
-        orient="records",
-        lines=True,
-    )
-    required_columns = {"bugid", "paper_correct"}
-    missing_columns = required_columns - set(annotations.columns)
-    if missing_columns:
-        raise ValueError(
-            "Manual annotation file is missing columns: "
-            f"{sorted(missing_columns)}"
-        )
-
-    annotations = annotations[["bugid", "paper_correct"]]
-    conflicting = (
-        annotations.groupby("bugid")["paper_correct"].nunique() > 1
-    )
-    if conflicting.any():
-        raise ValueError(
-            "Manual annotation file has conflicting labels for bugids: "
-            f"{sorted(conflicting[conflicting].index.astype(str))}"
-        )
-    annotations = annotations.drop_duplicates("bugid")
-    if annotations["paper_correct"].isna().any():
-        raise ValueError("Manual paper_correct labels cannot be null")
-
-    return dict(
-        zip(
-            annotations["bugid"].astype(str),
-            annotations["paper_correct"].astype(bool),
-        )
+    return pd.concat(
+        output_groups,
+        ignore_index=True,
     )
 
 
-def set_evaluation_labels(
-    df: pd.DataFrame,
-    paper_correct_annotations: dict[str, bool],
-) -> pd.DataFrame:
-    # Identical:
-    # generated patch matches the developer patch.
-    df["identical"] = (
-        df["normalized_patch"]
-        == df["normalized_target"]
-    )
-
-    # Correct:
-    # manual/semantic correctness.
-    # Do NOT infer correctness from identical.
-    df["paper_correct"] = (
-        df["bugid"]
-        .astype(str)
-        .map(paper_correct_annotations)
-        .astype("boolean")
-    )
-
-    return df
-
+# ============================================================
+# Main
+# ============================================================
 
 def main():
+
+    sequence_file = (
+        output_dir
+        / f"sequences_{output_size}.jsonl"
+    )
+
+    final_file = (
+        output_dir
+        / f"final_candidates_{output_size}.jsonl"
+    )
+
+    if not sequence_file.is_file():
+        raise FileNotFoundError(
+            f"Generation result not found:\n"
+            f"{sequence_file}"
+        )
+
+    print(
+        f"Loading:\n{sequence_file}"
+    )
+
     checkpoints_results = pd.read_json(
-        output_dir / f"sequences_{output_size}.jsonl",
+        sequence_file,
         orient="records",
         lines=True,
     )
 
-    checkpoint_counts = checkpoints_results["checkpoint"].value_counts()
+    # --------------------------------------------------------
+    # Validate checkpoints
+    # --------------------------------------------------------
+
+    checkpoint_counts = (
+        checkpoints_results["checkpoint"]
+        .value_counts()
+    )
+
+    print("\nCheckpoint counts:")
+    print(checkpoint_counts)
+
     if len(checkpoint_counts) != num_checkpoints:
         raise RuntimeError(
-            f"Expected {num_checkpoints} checkpoints, found "
-            f"{len(checkpoint_counts)}: {checkpoint_counts.to_dict()}"
+            f"Expected {num_checkpoints} checkpoints, "
+            f"found {len(checkpoint_counts)}"
         )
-    expected_rows_per_checkpoint = len(sources) * output_size
+
+    expected_rows_per_checkpoint = (
+        len(sources) * output_size
+    )
+
     invalid_counts = checkpoint_counts[
-        checkpoint_counts != expected_rows_per_checkpoint
+        checkpoint_counts
+        != expected_rows_per_checkpoint
     ]
+
     if not invalid_counts.empty:
         raise RuntimeError(
-            "Each checkpoint must contain "
-            f"{expected_rows_per_checkpoint} rows; invalid counts: "
+            "Invalid number of rows per checkpoint:\n"
             f"{invalid_counts.to_dict()}"
         )
 
-    column_index = (
-        checkpoints_results.columns[-2:].to_list()
-        + checkpoints_results.columns[:-2].to_list()
+    # --------------------------------------------------------
+    # Add source / target
+    # --------------------------------------------------------
+
+    print(
+        f"\nAll generated candidates: "
+        f"{len(checkpoints_results)}"
     )
 
-    checkpoints_results = checkpoints_results[column_index]
-    print("All:", len(checkpoints_results))
-    add_source_target(checkpoints_results)
+    checkpoints_results = add_source_target(
+        checkpoints_results
+    )
 
-    deduped_df = combine_candidates(normalize(checkpoints_results))
-    print("Deduped:", len(deduped_df))
-    paper_correct_annotations = load_paper_correct_annotations()
-    set_evaluation_labels(
-    deduped_df,
-    paper_correct_annotations,
-)
+    # --------------------------------------------------------
+    # Normalize
+    # --------------------------------------------------------
 
-    if paper_correct_annotations:
-        missing_bugs = set(deduped_df["bugid"]) - set(
-            paper_correct_annotations
+    checkpoints_results = normalize(
+        checkpoints_results
+    )
+
+    # --------------------------------------------------------
+    # Combine
+    # --------------------------------------------------------
+
+    deduped_df = combine_candidates(
+        checkpoints_results
+    )
+
+    print(
+        f"Deduped candidates: "
+        f"{len(deduped_df)}"
+    )
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Do NOT calculate "correct" here.
+    #
+    # Correctness is determined by the validation/reference
+    # stage, not simply by normalized_patch == normalized_target.
+    # --------------------------------------------------------
+
+    if "correct" in deduped_df.columns:
+        deduped_df = deduped_df.drop(
+            columns=["correct"]
         )
-        if missing_bugs:
-            raise ValueError(
-                "Manual annotations are incomplete; missing bugids: "
-                f"{sorted(missing_bugs)}"
-            )
-        print(
-            "Paper metric: manual correctness labels loaded for "
-            f"{len(paper_correct_annotations)} bugs"
+
+    if "plausible" in deduped_df.columns:
+        deduped_df = deduped_df.drop(
+            columns=["plausible"]
         )
-    else:
-        print(
-            "Paper metric: unavailable until "
-            "MULTIMEND_PAPER_CORRECT_FILE is provided"
+
+    if "paper_correct" in deduped_df.columns:
+        deduped_df = deduped_df.drop(
+            columns=["paper_correct"]
         )
+
+    # --------------------------------------------------------
+    # Save
+    # --------------------------------------------------------
 
     deduped_df.to_json(
-        output_dir / f"final_candidates_{output_size}.jsonl",
+        final_file,
         orient="records",
         lines=True,
+    )
+
+    print(
+        f"\nSaved:\n{final_file}"
     )
 
 
