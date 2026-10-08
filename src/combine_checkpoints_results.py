@@ -1,5 +1,6 @@
 import os
 from itertools import chain
+from pathlib import Path
 
 import pandas as pd
 
@@ -49,6 +50,7 @@ output_dir = gen_dir / f"outputs-{model}-{context_strategy}"
 
 output_size = 100
 num_checkpoints = 5
+paper_correct_file = os.environ.get("MULTIMEND_PAPER_CORRECT_FILE")
 
 rem_file_path = gen_dir / "rem.txt"
 add_file_path = gen_dir / "add.txt"
@@ -149,13 +151,74 @@ def combine_candidates(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(concat_dfs, ignore_index=True)
 
 
-def set_exact_matches(df: pd.DataFrame) -> pd.DataFrame:
-    exact_match_condition = df["normalized_patch"] == df["normalized_target"]
-    df["exact_match"] = exact_match_condition
-    # Paper correctness may include semantically equivalent patches and
-    # therefore cannot be inferred from the developer-patch string alone.
-    # It is kept as a separate, manually reviewed annotation.
-    df["paper_correct"] = False
+def load_paper_correct_annotations() -> dict[str, bool]:
+    """Load manually reviewed bug labels used by the paper protocol."""
+
+    if not paper_correct_file:
+        return {}
+
+    annotation_path = Path(paper_correct_file)
+    if not annotation_path.is_file():
+        raise FileNotFoundError(
+            "MULTIMEND_PAPER_CORRECT_FILE does not exist: "
+            f"{annotation_path}"
+        )
+
+    annotations = pd.read_json(
+        annotation_path,
+        orient="records",
+        lines=True,
+    )
+    required_columns = {"bugid", "paper_correct"}
+    missing_columns = required_columns - set(annotations.columns)
+    if missing_columns:
+        raise ValueError(
+            "Manual annotation file is missing columns: "
+            f"{sorted(missing_columns)}"
+        )
+
+    annotations = annotations[["bugid", "paper_correct"]]
+    conflicting = (
+        annotations.groupby("bugid")["paper_correct"].nunique() > 1
+    )
+    if conflicting.any():
+        raise ValueError(
+            "Manual annotation file has conflicting labels for bugids: "
+            f"{sorted(conflicting[conflicting].index.astype(str))}"
+        )
+    annotations = annotations.drop_duplicates("bugid")
+    if annotations["paper_correct"].isna().any():
+        raise ValueError("Manual paper_correct labels cannot be null")
+
+    return dict(
+        zip(
+            annotations["bugid"].astype(str),
+            annotations["paper_correct"].astype(bool),
+        )
+    )
+
+
+def set_evaluation_labels(
+    df: pd.DataFrame,
+    paper_correct_annotations: dict[str, bool],
+) -> pd.DataFrame:
+    # Identical:
+    # generated patch matches the developer patch.
+    df["identical"] = (
+        df["normalized_patch"]
+        == df["normalized_target"]
+    )
+
+    # Correct:
+    # manual/semantic correctness.
+    # Do NOT infer correctness from identical.
+    df["paper_correct"] = (
+        df["bugid"]
+        .astype(str)
+        .map(paper_correct_annotations)
+        .astype("boolean")
+    )
+
     return df
 
 
@@ -194,7 +257,30 @@ def main():
 
     deduped_df = combine_candidates(normalize(checkpoints_results))
     print("Deduped:", len(deduped_df))
-    set_exact_matches(deduped_df)
+    paper_correct_annotations = load_paper_correct_annotations()
+    set_evaluation_labels(
+    deduped_df,
+    paper_correct_annotations,
+)
+
+    if paper_correct_annotations:
+        missing_bugs = set(deduped_df["bugid"]) - set(
+            paper_correct_annotations
+        )
+        if missing_bugs:
+            raise ValueError(
+                "Manual annotations are incomplete; missing bugids: "
+                f"{sorted(missing_bugs)}"
+            )
+        print(
+            "Paper metric: manual correctness labels loaded for "
+            f"{len(paper_correct_annotations)} bugs"
+        )
+    else:
+        print(
+            "Paper metric: unavailable until "
+            "MULTIMEND_PAPER_CORRECT_FILE is provided"
+        )
 
     deduped_df.to_json(
         output_dir / f"final_candidates_{output_size}.jsonl",

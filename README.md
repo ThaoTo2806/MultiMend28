@@ -199,10 +199,8 @@ Nếu A2 không thắng B1 trên development set về correct fixes hoặc top-k
 
 ### Hiệu quả repair
 
-- `exact_match`: patch sau chuẩn hóa giống developer patch;
-- `paper_correct`: nhãn đánh giá thủ công theo tiêu chí của paper (developer
-  patch, patch được cộng đồng review, hoặc tương đương ngữ nghĩa);
-- plausible bugs: patch vượt qua test suite;
+- exact match với developer patch;
+- correct/plausible bugs theo chuẩn paper;
 - correct@1, @5, @10, @100, @500;
 - số fix riêng của từng strategy và overlap;
 - single-hunk so với multi-hunk;
