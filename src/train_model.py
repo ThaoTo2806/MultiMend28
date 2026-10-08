@@ -98,7 +98,7 @@ print(concatenated_dataset)
 
 # Setting generate hyperparameters
 generation_config = GenerationConfig(
-    max_lenght=max_target_length,
+    max_length=max_target_length,
     min_length=0,
     early_stopping=True,
     num_beams=5,

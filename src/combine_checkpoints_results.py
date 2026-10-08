@@ -166,7 +166,22 @@ def main():
         lines=True,
     )
 
-    assert len(checkpoints_results.value_counts("checkpoint")) == num_checkpoints
+    checkpoint_counts = checkpoints_results["checkpoint"].value_counts()
+    if len(checkpoint_counts) != num_checkpoints:
+        raise RuntimeError(
+            f"Expected {num_checkpoints} checkpoints, found "
+            f"{len(checkpoint_counts)}: {checkpoint_counts.to_dict()}"
+        )
+    expected_rows_per_checkpoint = len(sources) * output_size
+    invalid_counts = checkpoint_counts[
+        checkpoint_counts != expected_rows_per_checkpoint
+    ]
+    if not invalid_counts.empty:
+        raise RuntimeError(
+            "Each checkpoint must contain "
+            f"{expected_rows_per_checkpoint} rows; invalid counts: "
+            f"{invalid_counts.to_dict()}"
+        )
 
     column_index = (
         checkpoints_results.columns[-2:].to_list()

@@ -51,6 +51,10 @@ N_WORKERS = int(
     os.environ.get("MULTIMEND_VALIDATION_JOBS", "6")
 )
 
+RESET_VALIDATION = os.environ.get(
+    "MULTIMEND_RESET_VALIDATION", "0"
+).lower() in {"1", "true", "yes"}
+
 rem_file_path = gen_dir / "rem.txt"
 add_file_path = gen_dir / "add.txt"
 
@@ -292,6 +296,22 @@ def save_validation_state(df: pd.DataFrame, bugid: str) -> None:
     temporary_path.replace(save_path)
 
 
+def reset_stale_validation_state(candidate_file: Path) -> None:
+    """Discard state produced from an older candidate file."""
+    if not save_state_dir.exists():
+        return
+
+    candidate_mtime = candidate_file.stat().st_mtime_ns
+    state_files = list(save_state_dir.glob("*.jsonl"))
+    latest_state_mtime = (
+        max(path.stat().st_mtime_ns for path in state_files)
+        if state_files
+        else 0
+    )
+    if state_files and latest_state_mtime < candidate_mtime:
+        shutil.rmtree(save_state_dir)
+
+
 def main():
 
     n_jobs = N_WORKERS
@@ -317,11 +337,17 @@ def main():
     print(f"Metadata programs: {metadata_programs}")
     print(f"Programs to validate: {len(bugs_metadata)}")
 
+    candidate_file = output_dir / f"final_candidates_{output_size}.jsonl"
     candidate_patches_df = pd.read_json(
-        output_dir / f"final_candidates_{output_size}.jsonl",
+        candidate_file,
         orient="records",
         lines=True,
     )
+
+    if RESET_VALIDATION:
+        shutil.rmtree(save_state_dir, ignore_errors=True)
+    else:
+        reset_stale_validation_state(candidate_file)
 
     # Always initialize these columns.
     candidate_patches_df["plausible"] = False

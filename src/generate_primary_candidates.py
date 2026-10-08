@@ -52,13 +52,16 @@ def get_checkpoints(checkpoints_dir: Path) -> list[tuple[str, Path]]:
         raise RuntimeError(
             f"Need at least {num_checkpoints} valid checkpoints, found {len(checkpoints)}"
         )
-    selected = checkpoints[-num_checkpoints:]
-    if len({step for step, _, _ in selected}) != num_checkpoints:
+    selected_checkpoints = checkpoints[-num_checkpoints:]
+    if len({step for step, _, _ in selected_checkpoints}) != num_checkpoints:
         raise RuntimeError("Selected checkpoints have duplicate global_step values")
     print("Selected checkpoints:")
-    for step, name, _ in selected:
+    for step, name, _ in selected_checkpoints:
         print(f"- {name}: global_step={step}")
-    return [(name, checkpoint) for step, name, checkpoint in selected]
+    return [
+        (name, checkpoint)
+        for step, name, checkpoint in selected_checkpoints
+    ]
 
 
 def load_test_input_from_meta(prefix: str) -> Dataset:
@@ -222,6 +225,16 @@ def save_results(checkpoints_results: list[Dataset]) -> None:
     bugid_added = concatenated_results.add_column("bugid", input_bugs_hunks["bugid"])
     hunk_added = bugid_added.add_column("hunk", input_bugs_hunks["hunk"])
 
+    total_hunks = sum(len(hunks) for hunks in bugs_metadata.values())
+    expected_rows = total_hunks * num_return_sequences * len(checkpoints_results)
+    if len(hunk_added) != expected_rows:
+        raise RuntimeError(
+            f"Generation produced {len(hunk_added)} rows; "
+            f"expected {expected_rows} "
+            f"({total_hunks} hunks x {num_return_sequences} candidates "
+            f"x {len(checkpoints_results)} checkpoints)"
+        )
+
     hunk_added.to_json(output_dir / f"sequences_{beam_size}.jsonl")
 
 
@@ -271,6 +284,11 @@ num_checkpoints = 5
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 checkpoints = get_checkpoints(checkpoints_dir)
+if len(checkpoints) != num_checkpoints:
+    raise RuntimeError(
+        f"Checkpoint selection returned {len(checkpoints)} entries; "
+        f"expected exactly {num_checkpoints}"
+    )
 tokenizer = AutoTokenizer.from_pretrained(checkpoints[0][1])
 
 output_dir.mkdir(parents=True, exist_ok=True)
@@ -287,7 +305,7 @@ tokenized_test_dataset.set_format("torch")
 output_dir.mkdir(exist_ok=True)
 
 checkpoints_results: list[Dataset] = []
-for ch_name, checkpoint in checkpoints[-num_checkpoints:]:
+for ch_name, checkpoint in checkpoints:
     print(f"Generating from {ch_name}...")
     model = AutoModelForSeq2SeqLM.from_pretrained(checkpoint).to(device)
     decoder_start_token_id = next(
